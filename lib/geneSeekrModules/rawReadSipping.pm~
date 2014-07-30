@@ -1,0 +1,184 @@
+package rawReadSipping;
+
+use warnings;
+#use strict;
+use Cwd;
+use Time::Piece;
+use threads;
+use File::Path qw(make_path remove_tree);
+use File::Find;
+use Bio::SeqIO;
+use File::Copy;
+use Data::Dumper qw(Dumper);
+use CGI::Carp 'fatalsToBrowser';
+
+our $dateTime;
+
+my $path = getcwd;
+make_path("$path/SipprResults");
+
+##########################################
+sub dateTime {
+	return ($dateTime);
+}
+
+###########################################
+# Object oriented module for creating a new object
+# I don't really know what's going on here
+sub new {
+	my ($class, @args) = @_;
+	bless {}, $class;
+}
+###########################################
+sub targets {
+	chdir ("$path/SipprTarget");
+	my @targetGenes = glob("*.fa");
+	my %targetList;
+
+	foreach my $gene (@targetGenes) {
+		open (TARGETS, "<", $gene);
+		$gene =~ s/.fa//;
+		while (<TARGETS>) {
+		# Get names by the ">"
+			if (/>/) {
+				$_ =~ s/>//;
+				$_ =~ s/_.+//;
+				chomp $_;
+				$targetList{$gene}{$_} = "+";
+			}
+		}
+		close TARGETS;	
+	}
+	chdir ("$path");
+	return %targetList;
+}
+############################################
+sub sippr {
+	
+	# This start time will be used in calculating the total time of the run
+	my $start_time = time;
+
+	# Initialize variables
+	my ($sequenceName, $forwardReverse, $geneName, @folders, $fastaTitle);
+	my (%sippr, %targets);
+
+	# Determine the number of threads present in the system
+	my @cpus = `awk '/^processor/ { N++} END { print N }' /proc/cpuinfo`;
+	chomp @cpus;
+
+	chdir ("$path/SipprTarget");
+	my @targetGenes = glob("*.fa");
+
+	foreach my $gene (@targetGenes) {
+		(my $geneName = $gene) =~ s/.fa//;
+		unless (-e ("$geneName.smi")) {
+			system ("smalt index -k 5 -s 1 $geneName $gene");
+		}
+		# Create the index .fai file for use in mapping
+		unless (-e ("$geneName.fai")) {
+			system ("samtools faidx $gene");
+		}
+	}
+
+	# The files must be in the "uploads" subfolder. This subfolder must only have sequences that you wish to examine, or the program won't be able to find them
+	chdir ("$path/uploads");
+
+	#Grab the fastq files for manipulations
+	my @fastqF = glob("*R1_001.fastq");
+	my @fastqR = glob("*R2_002.fastq");
+
+	while (scalar(@threads) < @cpus) {
+		# Loop through each file to be subtyped
+		foreach my $file (@fastqF) {
+				foreach my $gene (@targetGenes) {
+				# Make a new thread using the blast subroutine - pass appropriate values to subroutine
+				my $r = threads->new(\&rawMapping, $path, $file, $gene);
+				# Output data to @threads. Right now, all this does is increase the size for the scalar(@threads) portion of the while loop
+				push(@threads,$r);
+			}
+		}
+	}
+	my $time =  localtime;
+	my $date = $time->ymd;	
+	my $hms = $time->hms("_");	
+	$dateTime = $date.$hms;	
+	
+	# This loop ensures that each thread is complete before terminating
+	foreach (@threads) {
+		my $num = $_->join;
+		# As the values returned from the blast subroutine are a hash of hashes, $num must be treated as such - %$num
+		# $results{$file}{$geneName}{$fastaTitle} = "+"
+		foreach my $geneTarget (sort keys %$num) {
+			foreach my $strain (sort keys %{ $$num{$geneTarget} }) {
+				foreach my $fastaTitle (sort keys %{ $$num{$geneTarget}{$strain} }){
+					chomp $fastaTitle;
+					$sippr{$geneTarget}{$strain}{$fastaTitle} = $$num{$geneTarget}{$strain}{$fastaTitle}
+				}
+			}
+		}
+	}
+	chdir ("$path");
+	return %sippr;
+}
+
+###############################################################################
+sub rawMapping {
+	my ($path, $rawFile, $gene) = @_;
+	(my $geneName = $gene) =~ s/.fa//;
+	(my $file = $rawFile) =~ s/_R1_001.fastq//;
+	make_path("$path/SipprResults/$file/$geneName");
+	chdir ("$path/uploads");
+	my $name = "$file" . "_$geneName";
+	# Perform smalt mapping
+	unless (-e ("$path/SipprResults/$file/$geneName/$name.sam")) {
+		system("smalt map -f samsoft -o $path/SipprResults/$file/$geneName/$name.sam -n 24 $path/SipprTarget/$geneName $rawFile");
+	}
+	chdir ("$path/SipprResults/$file/$geneName");
+	# Use samtools view to convert sam to bam
+	unless (-e("$name.bam")){
+		system ("samtools view -b -S $name.sam -o $name.bam");
+	}
+	# Sort the bam file
+	unless (-e("$name" . "_sorted.bam")) {
+		system ("samtools sort $name.bam $name" . "_sorted");
+	}
+	# Produce a fastq file from the sorted bam file using the reference and these piped tools
+	unless (-e("$name" . "_consensus.fastq")) {
+		system ("samtools mpileup -uf $path/SipprTarget/$gene $name" . "_sorted.bam | bcftools view -cg - | vcfutils.pl vcf2fq > $name" . "_consensus.fastq");
+	}
+	# Use BioPerl to convert the fastq to fasta
+	unless (-e("$name" . "_consensus.fa")) {
+		my $seqin = Bio::SeqIO -> new (-format => 'fastq',-file => "$name" . "_consensus.fastq");
+		my $seqout = Bio::SeqIO -> new (-format => 'fasta',-file => ">$name" . "_consensus.fa");
+		while (my $seq_obj = $seqin -> next_seq) {
+			$seqout -> write_seq($seq_obj);
+		}
+	}
+	make_path("$path/SipprResults/reports");
+	copy("$name" . "_consensus.fa", "$path/SipprResults/reports/$name" . "_consensus.fa");
+	open(FASTA, "<", "$name" . "_consensus.fa");
+	while (<FASTA>) {
+		if (/^\>/) {
+			($fastaTitle = $_) =~ s/>//;
+			chomp $fastaTitle;
+			# %results -> strain name; length of reads; target gene series name; target gene name; presence
+			$results{$geneName}{$file}{$fastaTitle} = "+";
+		}
+	}
+	#chdir ("$path");
+	return \%results;
+}
+#################################################################
+sub commas {
+	my $sepchar = grep(/,/ => @_) ? ";" : ",";
+	(@_ == 0) ? ''			:
+	(@_ == 1) ? $_[0]		:
+	(@_ == 2) ? join(", ", @_)	:
+		    join("$sepchar ", @_[0 .. ($#_-1)], "$_[-1]");
+
+
+}
+
+################################################################
+# Modules need to end on something that evaluates to true
+1;
